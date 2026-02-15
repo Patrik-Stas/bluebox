@@ -1,0 +1,54 @@
+FROM rust:bookworm
+
+# Install common dev tools + node (needed for Claude Code)
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    python3 \
+    python3-pip \
+    build-essential \
+    vim \
+    jq \
+    sudo \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js (for Claude Code)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (Python toolchain manager)
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# Install Claude Code globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Create non-root user with sudo access
+RUN useradd -m -s /bin/bash dev \
+    && echo 'dev ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+# Create workspace and claude config directories
+RUN mkdir -p /home/dev/workspace /home/dev/.claude \
+    && chown dev:dev /home/dev/workspace /home/dev/.claude
+
+# Terminal and shell setup
+ENV TERM=xterm-256color
+RUN echo 'export PS1="[\$SANDBOX_NAME] \w \$ "' >> /home/dev/.bashrc
+
+USER dev
+
+# Install common Rust tools
+RUN rustup component add clippy rustfmt \
+    && cargo install cargo-watch cargo-edit
+
+# Install mdboard permanently
+RUN uv tool install mdboard
+
+WORKDIR /home/dev/workspace
+
+EXPOSE 9000
+
+CMD ["/home/dev/.local/bin/mdboard", "--port", "9000"]

@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE_NAME="bluebox"
+CONTAINER_PREFIX="bluebox"
+VOLUME_PREFIX="bluebox"
+SHARED_DIR="${HOME}/.bluebox/shared"
+
+# Find Dockerfiles: next to the script (dev), or in Homebrew share dir
+_find_data_dir() {
+    local self_dir
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    # Check next to the script first (development / git clone)
+    if [[ -f "${self_dir}/Dockerfile.bluebox" ]]; then
+        echo "${self_dir}"
+        return
+    fi
+
+    # Homebrew: script is in bin/, Dockerfiles are in share/bluebox/
+    local share_dir="${self_dir}/../share/bluebox"
+    if [[ -f "${share_dir}/Dockerfile.bluebox" ]]; then
+        echo "$(cd "${share_dir}" && pwd)"
+        return
+    fi
+
+    echo "Error: Cannot find Dockerfiles. Looked in:" >&2
+    echo "  ${self_dir}/" >&2
+    echo "  ${share_dir}/" >&2
+    exit 1
+}
+
+DATA_DIR="$(_find_data_dir)"
+
+usage() {
+    cat <<'EOF'
+Usage: bluebox <command> [args]
+
+Commands:
+  build              Build/rebuild the Docker image
+  create <name> [--rust] [--mdboard port] [-p port:port ...]  Create a new sandbox
+  enter <name>       Open a shell in a running sandbox
+  list               List all sandbox environments and their status
+  start <name>       Start a stopped sandbox
+  stop <name>        Stop a running sandbox (data preserved)
+  destroy <name>     Remove container (workspace volume preserved)
+  nuke <name>        Remove container + volume + shared data (permanent)
+EOF
+    exit 1
+}
+
+container_name() {
+    echo "${CONTAINER_PREFIX}-${1}"
+}
+
+volume_name() {
+    echo "${VOLUME_PREFIX}-${1}-data"
+}
+
+
+
+cmd_build() {
+    echo "Building ${IMAGE_NAME} image..."
+    docker build -t "${IMAGE_NAME}" -f "${DATA_DIR}/Dockerfile.bluebox" "${DATA_DIR}"
+    echo "Building ${IMAGE_NAME}-rust image..."
+    docker build -t "${IMAGE_NAME}-rust" -f "${DATA_DIR}/Dockerfile.bluebox-rust" "${DATA_DIR}"
+    echo "Done."
+}
+
+cmd_create() {
+    local name="$1"
+    shift
+    local cname port_args=() mdboard_port="" base_image="${IMAGE_NAME}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rust)
+                base_image="${IMAGE_NAME}-rust"
+                shift
+                ;;
+            -p)
+                [[ $# -lt 2 ]] && { echo "Error: -p requires a port mapping (e.g. -p 8080:8080)."; exit 1; }
+                port_args+=(-p "$2")
+                shift 2
+                ;;
+            --mdboard)
+                [[ $# -lt 2 ]] && { echo "Error: --mdboard requires a port number."; exit 1; }
+                mdboard_port="$2"
+                shift 2
+                ;;
+            *)
+                echo "Error: unknown option '$1'"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Add mdboard port mapping
+    if [[ -n "$mdboard_port" ]]; then
+        port_args+=(-p "${mdboard_port}:9000")
+    fi
+
+    cname="$(container_name "$name")"
+
+    # Check if container already exists
+    if docker ps -a --format '{{.Names}}' | grep -qx "${cname}"; then
+        echo "Error: sandbox '${name}' already exists. Use 'enter' to connect or 'destroy' to remove it."
+        exit 1
+    fi
+
+    # Ensure base image exists
+    if ! docker image inspect "${base_image}" &>/dev/null; then
+        echo "Image '${base_image}' not found. Run 'bluebox build' first."
+        exit 1
+    fi
+
+    # Check for API key
+    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+        echo "Warning: ANTHROPIC_API_KEY is not set. Claude Code won't be able to authenticate."
+        echo "Set it in your shell and re-create, or export it inside the container."
+    fi
+
+    echo "Creating sandbox '${name}'..."
+
+    # Build project-specific image from base
+    local project_image="${IMAGE_NAME}-${name}"
+    echo "Building project image '${project_image}'..."
+    docker build -q -t "${project_image}" \
+        --build-arg "BASE_IMAGE=${base_image}" \
+        --build-arg "PROJECT_NAME=${name}" \
+        -f "${DATA_DIR}/Dockerfile.bluebox-project" "${DATA_DIR}" >/dev/null
+
+    # Use project directory in current working directory (created if it doesn't exist)
+    local project_dir="$(pwd)/${name}"
+    mkdir -p "${project_dir}"
+
+    # Create shared directory on host for file exchange
+    local shared="${SHARED_DIR}/${name}"
+    mkdir -p "${shared}"
+
+    docker run -d \
+        --name "${cname}" \
+        -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
+        -e "SANDBOX_NAME=${name}" \
+        -v "${project_dir}:/home/dev/${name}" \
+        -v "${shared}:/home/dev/shared" \
+        "${port_args[@]+"${port_args[@]}"}" \
+        "${project_image}" >/dev/null
+
+    echo "Sandbox '${name}' created and running."
+    echo "Project directory: ${project_dir}/"
+    echo "  Host:      ${project_dir}/"
+    echo "  Container: /home/dev/${name}/"
+    echo "Use 'bluebox enter ${name}' to open a shell."
+}
+
+cmd_enter() {
+    local name="$1"
+    local cname
+    cname="$(container_name "$name")"
+
+    # Check container exists and is running
+    local state
+    state="$(docker inspect -f '{{.State.Status}}' "${cname}" 2>/dev/null || true)"
+
+    if [[ -z "$state" ]]; then
+        echo "Error: sandbox '${name}' does not exist. Create it with 'bluebox create ${name}'."
+        exit 1
+    fi
+
+    if [[ "$state" != "running" ]]; then
+        echo "Error: sandbox '${name}' is not running (status: ${state}). Start it with 'bluebox start ${name}'."
+        exit 1
+    fi
+
+    exec docker exec -it -w "/home/dev/${name}" "${cname}" bash
+}
+
+cmd_list() {
+    local containers
+    containers="$(docker ps -a --filter "name=^${CONTAINER_PREFIX}-" --format '{{.Names}}\t{{.Status}}' 2>/dev/null || true)"
+
+    if [[ -z "$containers" ]]; then
+        echo "No sandbox environments found."
+        return
+    fi
+
+    printf "%-25s %-12s %-28s %s\n" "NAME" "STATE" "MDBOARD" "RESUME"
+    printf "%-25s %-12s %-28s %s\n" "----" "-----" "-------" "------"
+
+    while IFS=$'\t' read -r cname status; do
+        local sname="${cname#${CONTAINER_PREFIX}-}"
+        local mdboard_url="-"
+        local resume_hint=""
+        local state
+
+        state="$(docker inspect -f '{{.State.Status}}' "${cname}" 2>/dev/null || echo "unknown")"
+
+        if [[ "$state" == "running" ]]; then
+            local host_port
+            host_port="$(docker port "${cname}" 9000 2>/dev/null | head -1 | sed 's/.*://')"
+            if [[ -n "$host_port" ]]; then
+                mdboard_url="http://localhost:${host_port}"
+            fi
+        elif [[ "$state" == "exited" || "$state" == "created" ]]; then
+            resume_hint="bluebox start ${sname}"
+        fi
+
+        printf "%-25s %-12s %-28s %s\n" "$sname" "$state" "$mdboard_url" "$resume_hint"
+    done <<< "$containers"
+}
+
+cmd_start() {
+    local name="$1"
+    local cname
+    cname="$(container_name "$name")"
+
+    if ! docker ps -a --format '{{.Names}}' | grep -qx "${cname}"; then
+        echo "Error: sandbox '${name}' does not exist."
+        exit 1
+    fi
+
+    echo "Starting sandbox '${name}'..."
+    docker start "${cname}" >/dev/null
+    echo "Sandbox '${name}' is running."
+}
+
+cmd_stop() {
+    local name="$1"
+    local cname
+    cname="$(container_name "$name")"
+
+    if ! docker ps -a --format '{{.Names}}' | grep -qx "${cname}"; then
+        echo "Error: sandbox '${name}' does not exist."
+        exit 1
+    fi
+
+    echo "Stopping sandbox '${name}'..."
+    docker stop "${cname}" >/dev/null
+    echo "Sandbox '${name}' stopped. Data is preserved."
+}
+
+cmd_destroy() {
+    local name="$1"
+    local cname
+    cname="$(container_name "$name")"
+
+    if ! docker ps -a --format '{{.Names}}' | grep -qx "${cname}"; then
+        echo "Error: sandbox '${name}' does not exist."
+        exit 1
+    fi
+
+    echo "Removing container '${name}'... (workspace volume and shared data preserved)"
+    docker rm -f "${cname}" >/dev/null 2>&1 || true
+    echo "Container removed. Recreate with 'bluebox create ${name} -p ...' to reuse existing data."
+}
+
+cmd_nuke() {
+    local name="$1"
+    local cname vol shared
+    cname="$(container_name "$name")"
+    vol="$(volume_name "$name")"
+    shared="${SHARED_DIR}/${name}"
+
+    # Check if anything exists to nuke
+    local has_container has_volume has_shared
+    has_container=$(docker ps -a --format '{{.Names}}' | grep -qx "${cname}" && echo 1 || echo 0)
+    has_volume=$(docker volume ls -q | grep -qx "${vol}" && echo 1 || echo 0)
+    has_shared=$([[ -d "$shared" ]] && echo 1 || echo 0)
+
+    if [[ "$has_container" == 0 && "$has_volume" == 0 && "$has_shared" == 0 ]]; then
+        echo "Error: sandbox '${name}' does not exist."
+        exit 1
+    fi
+
+    echo "This will permanently delete:"
+    [[ "$has_container" == 1 ]] && echo "  - Container: ${cname}"
+    [[ "$has_volume" == 1 ]]    && echo "  - Volume:    ${vol} (workspace data)"
+    [[ "$has_shared" == 1 ]]    && echo "  - Shared:    ${shared}/"
+
+    read -rp "Nuke sandbox '${name}'? [y/N] " confirm
+    if [[ "$confirm" != [yY] ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    docker rm -f "${cname}" >/dev/null 2>&1 || true
+    docker volume rm "${vol}" >/dev/null 2>&1 || true
+    [[ -d "$shared" ]] && rm -rf "${shared}"
+    echo "Sandbox '${name}' nuked."
+}
+
+# --- Main ---
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    build)
+        cmd_build
+        ;;
+    create)
+        [[ $# -lt 1 ]] && { echo "Error: 'create' requires a name."; usage; }
+        cmd_create "$@"
+        ;;
+    enter)
+        [[ $# -lt 1 ]] && { echo "Error: 'enter' requires a name."; usage; }
+        cmd_enter "$1"
+        ;;
+    list)
+        cmd_list
+        ;;
+    start)
+        [[ $# -lt 1 ]] && { echo "Error: 'start' requires a name."; usage; }
+        cmd_start "$1"
+        ;;
+    stop)
+        [[ $# -lt 1 ]] && { echo "Error: 'stop' requires a name."; usage; }
+        cmd_stop "$1"
+        ;;
+    destroy)
+        [[ $# -lt 1 ]] && { echo "Error: 'destroy' requires a name."; usage; }
+        cmd_destroy "$1"
+        ;;
+    nuke)
+        [[ $# -lt 1 ]] && { echo "Error: 'nuke' requires a name."; usage; }
+        cmd_nuke "$1"
+        ;;
+    *)
+        echo "Unknown command: ${command}"
+        usage
+        ;;
+esac

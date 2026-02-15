@@ -1,0 +1,6 @@
+ARG BASE_IMAGE=bluebox
+FROM ${BASE_IMAGE}
+
+ARG PROJECT_NAME
+RUN mkdir -p /home/dev/${PROJECT_NAME}
+WORKDIR /home/dev/${PROJECT_NAME}
