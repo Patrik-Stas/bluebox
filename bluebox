@@ -38,7 +38,7 @@ Usage: bluebox <command> [args]
 
 Commands:
   build              Build/rebuild the Docker image
-  create <name> [--rust] [--mdboard port] [-p port:port ...]  Create a new sandbox
+  create <name> [--rust] [--native] [--dir path] [--mdboard port] [-p port:port ...]  Create a new sandbox
   enter <name>       Open a shell in a running sandbox
   list               List all sandbox environments and their status
   start <name>       Start a stopped sandbox
@@ -64,19 +64,32 @@ cmd_build() {
     docker build -t "${IMAGE_NAME}" -f "${DATA_DIR}/Dockerfile.bluebox" "${DATA_DIR}"
     echo "Building ${IMAGE_NAME}-rust image..."
     docker build -t "${IMAGE_NAME}-rust" -f "${DATA_DIR}/Dockerfile.bluebox-rust" "${DATA_DIR}"
+    echo "Building ${IMAGE_NAME}-native image..."
+    docker build -t "${IMAGE_NAME}-native" -f "${DATA_DIR}/Dockerfile.bluebox-native" "${DATA_DIR}"
+    echo "Building ${IMAGE_NAME}-rust-native image..."
+    docker build -t "${IMAGE_NAME}-rust-native" -f "${DATA_DIR}/Dockerfile.bluebox-rust-native" "${DATA_DIR}"
     echo "Done."
 }
 
 cmd_create() {
     local name="$1"
     shift
-    local cname port_args=() mdboard_port="" base_image="${IMAGE_NAME}"
+    local cname port_args=() mdboard_port="" base_image="${IMAGE_NAME}" custom_dir="" native=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --rust)
                 base_image="${IMAGE_NAME}-rust"
                 shift
+                ;;
+            --native)
+                native=1
+                shift
+                ;;
+            --dir)
+                [[ $# -lt 2 ]] && { echo "Error: --dir requires a path."; exit 1; }
+                custom_dir="$2"
+                shift 2
                 ;;
             -p)
                 [[ $# -lt 2 ]] && { echo "Error: -p requires a port mapping (e.g. -p 8080:8080)."; exit 1; }
@@ -94,6 +107,11 @@ cmd_create() {
                 ;;
         esac
     done
+
+    # Apply native variant
+    if [[ "$native" == 1 ]]; then
+        base_image="${base_image}-native"
+    fi
 
     # Add mdboard port mapping
     if [[ -n "$mdboard_port" ]]; then
@@ -130,9 +148,14 @@ cmd_create() {
         --build-arg "PROJECT_NAME=${name}" \
         -f "${DATA_DIR}/Dockerfile.bluebox-project" "${DATA_DIR}" >/dev/null
 
-    # Use project directory in current working directory (created if it doesn't exist)
-    local project_dir="$(pwd)/${name}"
-    mkdir -p "${project_dir}"
+    # Resolve project directory
+    local project_dir
+    if [[ -n "$custom_dir" ]]; then
+        project_dir="$(cd "$custom_dir" && pwd)"
+    else
+        project_dir="$(pwd)/${name}"
+        mkdir -p "${project_dir}"
+    fi
 
     # Create shared directory on host for file exchange
     local shared="${SHARED_DIR}/${name}"

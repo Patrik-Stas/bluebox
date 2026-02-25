@@ -35,6 +35,15 @@ bluebox create my-app --mdboard 9001
 # ~/projects/my-app/ now syncs with /home/dev/my-app/ inside the container
 ```
 
+Use `--dir` to mount an existing directory instead of creating a new one:
+
+```bash
+cd ~/projects/my-app
+bluebox create my-app --dir . --mdboard 9001
+
+# ~/projects/my-app/ (current dir) is mounted into the container
+```
+
 A shared directory at `~/.bluebox/shared/<name>/` is also mounted at `/home/dev/shared/` for file exchange between host and container.
 
 ## Working in a sandbox
