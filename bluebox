@@ -41,7 +41,7 @@ Commands:
   create <name> [--rust] [--native] [--dir path] [--mdboard port] [-p port:port ...]  Create a new sandbox
   enter <name>       Open a shell in a running sandbox
   list               List all sandbox environments and their status
-  start <name>       Start a stopped sandbox
+  start <name> [--mdboard port] [-p port:port ...]  Start a stopped sandbox (port overrides recreate container)
   stop <name>        Stop a running sandbox (data preserved)
   destroy <name>     Remove container (workspace volume preserved)
   nuke <name>        Remove container + volume + shared data (permanent)
@@ -235,17 +235,92 @@ cmd_list() {
 
 cmd_start() {
     local name="$1"
-    local cname
+    shift
+    local cname port_args=() mdboard_port="" has_port_override=0
     cname="$(container_name "$name")"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p)
+                [[ $# -lt 2 ]] && { echo "Error: -p requires a port mapping (e.g. -p 8080:8080)."; exit 1; }
+                port_args+=(-p "$2")
+                has_port_override=1
+                shift 2
+                ;;
+            --mdboard)
+                [[ $# -lt 2 ]] && { echo "Error: --mdboard requires a port number."; exit 1; }
+                mdboard_port="$2"
+                has_port_override=1
+                shift 2
+                ;;
+            *)
+                echo "Error: unknown option '$1'"
+                exit 1
+                ;;
+        esac
+    done
 
     if ! docker ps -a --format '{{.Names}}' | grep -qx "${cname}"; then
         echo "Error: sandbox '${name}' does not exist."
         exit 1
     fi
 
-    echo "Starting sandbox '${name}'..."
-    docker start "${cname}" >/dev/null
-    echo "Sandbox '${name}' is running."
+    if [[ "$has_port_override" == 1 ]]; then
+        # Recreate container with new port bindings (data is bind-mounted, so safe)
+        local image env_args=() mount_args=()
+
+        # Get the image
+        image="$(docker inspect -f '{{.Config.Image}}' "${cname}")"
+
+        # Get environment variables
+        while IFS= read -r env; do
+            env_args+=(-e "$env")
+        done < <(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${cname}" | grep -v '^$')
+
+        # Get bind mounts
+        while IFS= read -r mount; do
+            mount_args+=(-v "$mount")
+        done < <(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}:{{.Destination}}{{println}}{{end}}{{end}}' "${cname}" | grep -v '^$')
+
+        # Carry forward existing port mappings that aren't being overridden
+        local old_ports=()
+        while IFS= read -r mapping; do
+            [[ -z "$mapping" ]] && continue
+            local container_port="${mapping%%->*}"
+            container_port="${container_port##* }"
+            # Skip 9000/tcp if --mdboard is overriding it
+            if [[ -n "$mdboard_port" && "$container_port" == "9000/tcp" ]]; then
+                continue
+            fi
+            local host_part="${mapping##*->}"
+            host_part="$(echo "$host_part" | xargs)"
+            local host_port="${host_part##*:}"
+            container_port="${container_port%/*}"
+            old_ports+=(-p "${host_port}:${container_port}")
+        done < <(docker port "${cname}" 2>/dev/null)
+
+        # Add mdboard port mapping
+        if [[ -n "$mdboard_port" ]]; then
+            port_args+=(-p "${mdboard_port}:9000")
+        fi
+
+        # Combine old ports (that aren't overridden) with new ports
+        local all_ports=("${old_ports[@]+"${old_ports[@]}"}" "${port_args[@]+"${port_args[@]}"}")
+
+        echo "Recreating sandbox '${name}' with new port bindings..."
+        docker rm -f "${cname}" >/dev/null 2>&1
+        docker run -d \
+            --name "${cname}" \
+            "${env_args[@]+"${env_args[@]}"}" \
+            "${mount_args[@]+"${mount_args[@]}"}" \
+            "${all_ports[@]+"${all_ports[@]}"}" \
+            "${image}" >/dev/null
+        echo "Sandbox '${name}' is running."
+    else
+        echo "Starting sandbox '${name}'..."
+        docker start "${cname}" >/dev/null
+        echo "Sandbox '${name}' is running."
+    fi
 }
 
 cmd_stop() {
@@ -339,7 +414,7 @@ case "$command" in
         ;;
     start)
         [[ $# -lt 1 ]] && { echo "Error: 'start' requires a name."; usage; }
-        cmd_start "$1"
+        cmd_start "$@"
         ;;
     stop)
         [[ $# -lt 1 ]] && { echo "Error: 'stop' requires a name."; usage; }
