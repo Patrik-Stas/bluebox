@@ -26,7 +26,8 @@ RUN mkdir -p /home/dev/workspace /home/dev/.claude \
 
 # Terminal and shell setup
 ENV TERM=xterm-256color
-RUN echo 'export PS1="[\$SANDBOX_NAME] \w \$ "' >> /home/dev/.bashrc
+RUN echo 'export PS1="[\$SANDBOX_NAME] \w \$ "' >> /home/dev/.bashrc \
+    && echo 'alias dsp="claude --dangerously-skip-permissions"' >> /home/dev/.bashrc
 
 USER dev
 
