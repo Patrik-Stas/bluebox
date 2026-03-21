@@ -191,7 +191,10 @@ cmd_enter() {
         exit 1
     fi
 
-    if [[ "$state" != "running" ]]; then
+    if [[ "$state" == "exited" ]]; then
+        echo "Sandbox '${name}' is stopped. Starting it..."
+        docker start "${cname}" >/dev/null
+    elif [[ "$state" != "running" ]]; then
         echo "Error: sandbox '${name}' is not running (status: ${state}). Start it with 'bluebox start ${name}'."
         exit 1
     fi
